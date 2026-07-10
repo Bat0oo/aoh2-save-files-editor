@@ -36,6 +36,7 @@ class Aoh2Editor(tk.Tk):
         filemenu.add_command(label='Open Single File...', command=self.open_single_file)
         filemenu.add_separator()
         filemenu.add_command(label='Save Modified Files', command=self.save_all)
+        filemenu.add_command(label='Export Copy To Folder...', command=self.export_copy)
         filemenu.add_separator()
         filemenu.add_command(label='Exit', command=self.destroy)
         menubar.add_cascade(label='File', menu=filemenu)
@@ -85,12 +86,27 @@ class Aoh2Editor(tk.Tk):
         if not paths:
             messagebox.showwarning('No save files found', 'No Java-serialized files (magic bytes AC ED 00 05) were found in that folder.')
             return
+        if self.files:
+            unsaved = [os.path.basename(p) for p, i in self.files.items() if i['modified']]
+            if unsaved:
+                if not messagebox.askyesno('Unsaved changes', 'These files have unsaved edits that will be DISCARDED:\n\n' + '\n'.join(unsaved) + '\n\nOpen the new folder anyway?'):
+                    return
+            self._close_project()
         loaded = 0
         with self.busy(f'Loading {len(paths)} file(s)...'):
             for p in paths:
                 if self._load_one(p):
                     loaded += 1
         self.status_var.set(f'Loaded {loaded}/{len(paths)} file(s) from {folder}')
+
+    def _close_project(self):
+        self.files.clear()
+        self.item_node.clear()
+        self.item_owner.clear()
+        self.tree.delete(*self.tree.get_children(''))
+        self.filter_active = False
+        self._last_match_index = -1
+        self._last_query = None
 
     def open_single_file(self):
         path = filedialog.askopenfilename(title='Select save file')
@@ -388,6 +404,35 @@ class Aoh2Editor(tk.Tk):
             self._tooltip_win.destroy()
             self._tooltip_win = None
         self._tooltip_iid = None
+
+    def export_copy(self):
+        if not self.files:
+            messagebox.showwarning('Export', 'Open a project folder first.')
+            return
+        target = filedialog.askdirectory(title='Export copies into folder...')
+        if not target:
+            return
+        src_dirs = {os.path.dirname(os.path.abspath(p)) for p in self.files}
+        if os.path.abspath(target) in src_dirs:
+            messagebox.showerror('Export', "That's the same folder the save was loaded from.\nPick a different folder (or use Save Modified Files to save in place).")
+            return
+        exported, failed = ([], [])
+        with self.busy('Exporting...'):
+            for path, info in self.files.items():
+                out_path = os.path.join(target, os.path.basename(path))
+                try:
+                    data = codec.dump_to_bytes(info['root'])
+                    with open(out_path, 'wb') as f:
+                        f.write(data)
+                    exported.append(os.path.basename(path))
+                except Exception as e:
+                    failed.append(f'{os.path.basename(path)}: {type(e).__name__}: {e}')
+        msg = f'Exported {len(exported)} file(s) to:\n{target}'
+        if failed:
+            msg += '\n\nFAILED:\n' + '\n'.join(failed)
+        msg += '\n\nNote: exported files include your unsaved edits. The original save is untouched.'
+        (messagebox.showwarning if failed else messagebox.showinfo)('Export', msg)
+        self.status_var.set(f'Exported {len(exported)} file(s) to {target}')
 
     def save_all(self):
         saved = []
