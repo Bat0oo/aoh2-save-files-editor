@@ -1,10 +1,56 @@
 import os
 import contextlib
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import aoh2codec as codec
 
 class Aoh2Editor(tk.Tk):
+
+    def run_bg(self, message, work, done):
+        self._bg_running = True
+        win = tk.Toplevel(self)
+        win.title('Working...')
+        win.transient(self)
+        win.resizable(False, False)
+        win.protocol('WM_DELETE_WINDOW', lambda: None)
+        ttk.Label(win, text=message, padding=(16, 12)).pack()
+        pb = ttk.Progressbar(win, mode='indeterminate', length=280)
+        pb.pack(padx=16, pady=(0, 14))
+        pb.start(12)
+        try:
+            win.geometry(f'+{self.winfo_rootx() + 320}+{self.winfo_rooty() + 260}')
+            win.grab_set()
+        except tk.TclError:
+            pass
+        outcome = {}
+
+        def runner():
+            try:
+                outcome['value'] = work()
+            except Exception as e:
+                outcome['error'] = e
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+
+        def poll():
+            if t.is_alive():
+                self.after(80, poll)
+                return
+            pb.stop()
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            win.destroy()
+            try:
+                if 'error' in outcome:
+                    messagebox.showerror('Error', f'{type(outcome['error']).__name__}: {outcome['error']}')
+                else:
+                    done(outcome.get('value'))
+            finally:
+                self._bg_running = False
+        self.after(80, poll)
 
     @contextlib.contextmanager
     def busy(self, message='Working...'):
@@ -26,6 +72,8 @@ class Aoh2Editor(tk.Tk):
         self.files = {}
         self.item_node = {}
         self.item_owner = {}
+        self._bg_running = False
+        self._expanding = False
         self._build_menu()
         self._build_widgets()
 
@@ -92,12 +140,28 @@ class Aoh2Editor(tk.Tk):
                 if not messagebox.askyesno('Unsaved changes', 'These files have unsaved edits that will be DISCARDED:\n\n' + '\n'.join(unsaved) + '\n\nOpen the new folder anyway?'):
                     return
             self._close_project()
-        loaded = 0
-        with self.busy(f'Loading {len(paths)} file(s)...'):
+
+        def work():
+            results = []
             for p in paths:
-                if self._load_one(p):
-                    loaded += 1
-        self.status_var.set(f'Loaded {loaded}/{len(paths)} file(s) from {folder}')
+                try:
+                    results.append((p, codec.load_file(p), None))
+                except Exception as e:
+                    results.append((p, None, f'{type(e).__name__}: {e}'))
+            return results
+
+        def done(results):
+            loaded, errors = (0, [])
+            for p, root, err in results:
+                if err:
+                    errors.append(f'{os.path.basename(p)}: {err}')
+                    continue
+                self._register_file(p, root)
+                loaded += 1
+            self.status_var.set(f'Loaded {loaded}/{len(paths)} file(s) from {folder}')
+            if errors:
+                messagebox.showwarning('Some files failed to parse', '\n'.join(errors))
+        self.run_bg(f'Loading {len(paths)} file(s)...', work, done)
 
     def _close_project(self):
         self.files.clear()
@@ -124,13 +188,16 @@ class Aoh2Editor(tk.Tk):
         except Exception as e:
             messagebox.showerror('Failed to parse', f'{path}\n\n{type(e).__name__}: {e}')
             return False
+        self._register_file(path, root)
+        return True
+
+    def _register_file(self, path, root):
         self.files[path] = {'root': root, 'seen': set(), 'modified': False}
         iid = self.tree.insert('', 'end', text=os.path.basename(path), open=False)
         node = codec.describe(root, os.path.basename(path), self.files[path]['seen'])
         self.item_node[iid] = node
         self.item_owner[iid] = path
         self._ensure_expandable(iid, node)
-        return True
 
     def _ensure_expandable(self, iid, node):
         if node.kind in ('object', 'list') and (not self.tree.get_children(iid)):
@@ -268,18 +335,28 @@ class Aoh2Editor(tk.Tk):
         self.status_var.set(f"Match {self._last_match_index + 1}/{len(matches)} for '{query}'")
 
     def expand_all(self, max_nodes=20000):
+        if self._expanding:
+            return
+        self._expanding = True
         counter = [0]
+        try:
+            self.config(cursor='watch')
 
-        def rec(iid):
-            if counter[0] > max_nodes:
-                return
-            self.on_expand(iid=iid)
-            counter[0] += 1
-            for c in self.tree.get_children(iid):
-                rec(c)
-        with self.busy('Expanding tree...'):
+            def rec(iid):
+                if counter[0] > max_nodes:
+                    return
+                self.on_expand(iid=iid)
+                counter[0] += 1
+                if counter[0] % 150 == 0:
+                    self.status_var.set(f'Expanding tree... {counter[0]} nodes')
+                    self.update()
+                for c in self.tree.get_children(iid):
+                    rec(c)
             for top in self.tree.get_children(''):
                 rec(top)
+        finally:
+            self.config(cursor='')
+            self._expanding = False
         if counter[0] > max_nodes:
             self.status_var.set(f'Expanded {max_nodes} nodes (limit reached — use Filter to narrow down instead)')
         else:
@@ -305,22 +382,27 @@ class Aoh2Editor(tk.Tk):
             if want_id is not None:
                 return any((fields.get(k) == want_id for k in ID_FIELDS))
             return any((fields.get(k) is not None and want_tag in str(fields[k]).lower() for k in TAG_FIELDS))
-        with self.busy(f"Filtering for '{query}'..."):
-            self._filter_run(query, obj_matches)
+        snapshot = list(self.files.items())
 
-    def _filter_run(self, query, obj_matches):
+        def work():
+            results = []
+            for path, info in snapshot:
+                matches = [inst for inst in codec.iter_instances(info['root']) if obj_matches(codec.get_fields(inst))]
+                if matches:
+                    results.append((path, matches))
+            return results
+
+        def done(results):
+            self._filter_build(query, results)
+        self.run_bg(f"Filtering for '{query}'...", work, done)
+
+    def _filter_build(self, query, results):
         self.tree.delete(*self.tree.get_children(''))
         self.item_node.clear()
         self.item_owner.clear()
         total = 0
-        for path, info in self.files.items():
-            matches = []
-            for inst in codec.iter_instances(info['root']):
-                fields = codec.get_fields(inst)
-                if obj_matches(fields):
-                    matches.append(inst)
-            if not matches:
-                continue
+        for path, matches in results:
+            info = self.files[path]
             info['seen'] = set()
             head = self.tree.insert('', 'end', text=f"{os.path.basename(path)} — {len(matches)} match(es) for '{query}'", open=True)
             for inst in matches:
@@ -416,9 +498,11 @@ class Aoh2Editor(tk.Tk):
         if os.path.abspath(target) in src_dirs:
             messagebox.showerror('Export', "That's the same folder the save was loaded from.\nPick a different folder (or use Save Modified Files to save in place).")
             return
-        exported, failed = ([], [])
-        with self.busy('Exporting...'):
-            for path, info in self.files.items():
+        exported_files = list(self.files.items())
+
+        def work():
+            exported, failed = ([], [])
+            for path, info in exported_files:
                 out_path = os.path.join(target, os.path.basename(path))
                 try:
                     data = codec.dump_to_bytes(info['root'])
@@ -427,31 +511,45 @@ class Aoh2Editor(tk.Tk):
                     exported.append(os.path.basename(path))
                 except Exception as e:
                     failed.append(f'{os.path.basename(path)}: {type(e).__name__}: {e}')
-        msg = f'Exported {len(exported)} file(s) to:\n{target}'
-        if failed:
-            msg += '\n\nFAILED:\n' + '\n'.join(failed)
-        msg += '\n\nNote: exported files include your unsaved edits. The original save is untouched.'
-        (messagebox.showwarning if failed else messagebox.showinfo)('Export', msg)
-        self.status_var.set(f'Exported {len(exported)} file(s) to {target}')
+            return (exported, failed)
+
+        def done(result):
+            exported, failed = result
+            msg = f'Exported {len(exported)} file(s) to:\n{target}'
+            if failed:
+                msg += '\n\nFAILED:\n' + '\n'.join(failed)
+            msg += '\n\nNote: exported files include your unsaved edits. The original save is untouched.'
+            (messagebox.showwarning if failed else messagebox.showinfo)('Export', msg)
+            self.status_var.set(f'Exported {len(exported)} file(s) to {target}')
+        self.run_bg('Exporting...', work, done)
 
     def save_all(self):
-        saved = []
-        for path, info in self.files.items():
-            if not info['modified']:
-                continue
-            try:
-                backup = codec.save_file(info['root'], path, backup=True)
-            except Exception as e:
-                messagebox.showerror('Save failed', f'{path}\n\n{type(e).__name__}: {e}')
-                continue
-            info['modified'] = False
-            saved.append((path, backup))
-        if not saved:
+        to_save = [(p, i) for p, i in self.files.items() if i['modified']]
+        if not to_save:
             messagebox.showinfo('Save', 'No changes to save.')
             return
-        lines = [f'{os.path.basename(p)}  (backup: {(os.path.basename(b) if b else 'none')})' for p, b in saved]
-        messagebox.showinfo('Saved', 'Re-encoded and saved:\n\n' + '\n'.join(lines))
-        self.status_var.set('All changes saved.')
+
+        def work():
+            saved, failed = ([], [])
+            for path, info in to_save:
+                try:
+                    backup = codec.save_file(info['root'], path, backup=True)
+                    saved.append((path, backup))
+                except Exception as e:
+                    failed.append(f'{os.path.basename(path)}: {type(e).__name__}: {e}')
+            return (saved, failed)
+
+        def done(result):
+            saved, failed = result
+            for path, _ in saved:
+                self.files[path]['modified'] = False
+            if failed:
+                messagebox.showerror('Save failed', '\n'.join(failed))
+            if saved:
+                lines = [f'{os.path.basename(p)}  (backup: {(os.path.basename(b) if b else 'none')})' for p, b in saved]
+                messagebox.showinfo('Saved', 'Re-encoded and saved:\n\n' + '\n'.join(lines))
+                self.status_var.set('All changes saved.')
+        self.run_bg(f'Saving {len(to_save)} file(s)...', work, done)
 if __name__ == '__main__':
     app = Aoh2Editor()
     app.mainloop()
