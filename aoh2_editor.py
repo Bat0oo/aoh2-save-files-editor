@@ -281,16 +281,14 @@ class Aoh2Editor(tk.Tk):
             messagebox.showwarning('Filter', 'Open a project folder first.')
             return
         want_id = int(query) if query.lstrip('-').isdigit() else None
-        want_tag = None if want_id is not None else query.lower()
+        want_tag = query.lower()
+        TAG_FIELDS = ('sCivTag', 'sCivName', 'sTag', 'sName')
+        ID_FIELDS = ('iId', 'iID', 'iCivID', 'iCivId')
 
         def obj_matches(fields: dict) -> bool:
             if want_id is not None:
-                return fields.get('iId') == want_id
-            for key in ('sTag', 'sName', 'sCivTag'):
-                v = fields.get(key)
-                if v is not None and want_tag in str(v).lower():
-                    return True
-            return False
+                return any((fields.get(k) == want_id for k in ID_FIELDS))
+            return any((fields.get(k) is not None and want_tag in str(fields[k]).lower() for k in TAG_FIELDS))
         with self.busy(f"Filtering for '{query}'..."):
             self._filter_run(query, obj_matches)
 
@@ -311,11 +309,12 @@ class Aoh2Editor(tk.Tk):
             head = self.tree.insert('', 'end', text=f"{os.path.basename(path)} — {len(matches)} match(es) for '{query}'", open=True)
             for inst in matches:
                 fields = codec.get_fields(inst)
-                tag = fields.get('sTag') or fields.get('sName') or ''
-                iid_val = fields.get('iId')
-                label = codec.class_name(inst)
-                extra = ' '.join((x for x in (f'iId={iid_val}' if iid_val is not None else '', f'[{tag}]' if tag else '') if x))
-                node = codec.describe(inst, f'{label} {extra}'.strip(), info['seen'])
+                tag = next((str(fields[k]) for k in ('sCivTag', 'sTag') if fields.get(k)), '')
+                name = next((str(fields[k]) for k in ('sCivName', 'sName') if fields.get(k)), '')
+                iid_val = next((fields[k] for k in ('iId', 'iCivID', 'iCivId') if fields.get(k) is not None), None)
+                cls = codec.class_name(inst).rsplit('.', 1)[-1]
+                extra = '  '.join((x for x in (f'[{tag}]' if tag else '', name, f'id={iid_val}' if iid_val is not None else '') if x))
+                node = codec.describe(inst, f'{cls}  {extra}'.strip(), info['seen'])
                 child = self.tree.insert(head, 'end', text=node.label)
                 self.item_node[child] = node
                 self.item_owner[child] = path
