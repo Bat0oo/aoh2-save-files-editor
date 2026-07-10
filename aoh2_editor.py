@@ -1,9 +1,23 @@
 import os
+import contextlib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import aoh2codec as codec
 
 class Aoh2Editor(tk.Tk):
+
+    @contextlib.contextmanager
+    def busy(self, message='Working...'):
+        prev = self.status_var.get()
+        self.status_var.set(message)
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            yield
+        finally:
+            self.config(cursor='')
+            if self.status_var.get() == message:
+                self.status_var.set(prev)
 
     def __init__(self):
         super().__init__()
@@ -72,9 +86,10 @@ class Aoh2Editor(tk.Tk):
             messagebox.showwarning('No save files found', 'No Java-serialized files (magic bytes AC ED 00 05) were found in that folder.')
             return
         loaded = 0
-        for p in paths:
-            if self._load_one(p):
-                loaded += 1
+        with self.busy(f'Loading {len(paths)} file(s)...'):
+            for p in paths:
+                if self._load_one(p):
+                    loaded += 1
         self.status_var.set(f'Loaded {loaded}/{len(paths)} file(s) from {folder}')
 
     def open_single_file(self):
@@ -223,10 +238,9 @@ class Aoh2Editor(tk.Tk):
             return found
         matches = collect()
         if not matches:
-            self.status_var.set('No match yet — expanding tree and retrying...')
-            self.update_idletasks()
-            self.expand_all()
-            matches = collect()
+            with self.busy(f"Searching '{query}' (expanding tree)..."):
+                self.expand_all()
+                matches = collect()
         if not matches:
             self.status_var.set(f"No matches for '{query}'")
             return
@@ -247,8 +261,9 @@ class Aoh2Editor(tk.Tk):
             counter[0] += 1
             for c in self.tree.get_children(iid):
                 rec(c)
-        for top in self.tree.get_children(''):
-            rec(top)
+        with self.busy('Expanding tree...'):
+            for top in self.tree.get_children(''):
+                rec(top)
         if counter[0] > max_nodes:
             self.status_var.set(f'Expanded {max_nodes} nodes (limit reached — use Filter to narrow down instead)')
         else:
@@ -266,16 +281,20 @@ class Aoh2Editor(tk.Tk):
             messagebox.showwarning('Filter', 'Open a project folder first.')
             return
         want_id = int(query) if query.lstrip('-').isdigit() else None
-        want_tag = query.lower()
+        want_tag = None if want_id is not None else query.lower()
 
         def obj_matches(fields: dict) -> bool:
-            if want_id is not None and fields.get('iId') == want_id:
-                return True
+            if want_id is not None:
+                return fields.get('iId') == want_id
             for key in ('sTag', 'sName', 'sCivTag'):
                 v = fields.get(key)
                 if v is not None and want_tag in str(v).lower():
                     return True
             return False
+        with self.busy(f"Filtering for '{query}'..."):
+            self._filter_run(query, obj_matches)
+
+    def _filter_run(self, query, obj_matches):
         self.tree.delete(*self.tree.get_children(''))
         self.item_node.clear()
         self.item_owner.clear()
