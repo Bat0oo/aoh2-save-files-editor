@@ -103,11 +103,17 @@ def _set_size_field(instance: Any, new_size: int) -> bool:
                 return True
     return False
 
+def backup_dir_for(filepath: str) -> str:
+    save_name = os.path.basename(os.path.dirname(os.path.abspath(filepath)))
+    return os.path.join(os.path.expanduser('~'), 'AoH2SaveEditor_backups', save_name)
+
 def save_file(root: Any, filepath: str, backup: bool=True) -> str | None:
     backup_path = None
     if backup and os.path.exists(filepath):
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_path = f'{filepath}.bak_{ts}'
+        bdir = backup_dir_for(filepath)
+        os.makedirs(bdir, exist_ok=True)
+        backup_path = os.path.join(bdir, f'{os.path.basename(filepath)}.bak_{ts}')
         shutil.copy2(filepath, backup_path)
     data = dump_to_bytes(root)
     with open(filepath, 'wb') as f:

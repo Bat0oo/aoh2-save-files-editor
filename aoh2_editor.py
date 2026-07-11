@@ -111,6 +111,7 @@ class Aoh2Editor(tk.Tk):
         fentry.bind('<Return>', lambda e: self.filter_apply())
         ttk.Button(toolbar, text='Filter', command=self.filter_apply).pack(side='left')
         ttk.Button(toolbar, text='Clear', command=self.filter_clear).pack(side='left', padx=(2, 0))
+        ttk.Button(toolbar, text='Batch Edit...', command=self.batch_edit).pack(side='left', padx=(6, 0))
         self.status_var = tk.StringVar(value='No project open. File > Open Project Folder...')
         ttk.Label(self, textvariable=self.status_var).pack(fill='x', padx=8, pady=(0, 2), anchor='w')
         self.tree = ttk.Treeview(self, show='tree')
@@ -125,6 +126,51 @@ class Aoh2Editor(tk.Tk):
         self._last_match_index = -1
         self._last_query = None
         self.filter_active = False
+        self._filter_matches = []
+        self._filter_field = None
+
+    def batch_edit(self):
+        if not self.filter_active or not self._filter_matches:
+            messagebox.showwarning('Batch Edit', "Run a Filter first — Batch Edit applies to the filtered results.\n\nExample: filter  iTrueOwnerOfProvince=1  to select all provinces\nowned by civ 1, then batch-set that field to your civ's id.")
+            return
+        default_field = self._filter_field[0] if self._filter_field else ''
+        fname = simpledialog.askstring('Batch Edit', f'Field name to set on all {len(self._filter_matches)} filtered object(s):', initialvalue=default_field, parent=self)
+        if not fname:
+            return
+        new_str = simpledialog.askstring('Batch Edit', f"New value for '{fname}':", parent=self)
+        if new_str is None:
+            return
+        if not messagebox.askyesno('Confirm batch edit', f'Set  {fname} = {new_str}  on all {len(self._filter_matches)} filtered object(s)?\n\nThis modifies the loaded save data (you still need Save Modified Files to write to disk).'):
+            return
+        changed, skipped, errors = (0, 0, 0)
+        touched_paths = set()
+        for path, inst in self._filter_matches:
+            fields = codec.get_fields(inst)
+            real = next((k for k in fields if k.lower() == fname.lower()), None)
+            if real is None:
+                skipped += 1
+                continue
+            try:
+                new_value = self._coerce(fields[real], new_str)
+            except ValueError:
+                errors += 1
+                continue
+            if codec.set_field(inst, real, new_value):
+                changed += 1
+                touched_paths.add(path)
+        for path in touched_paths:
+            self.files[path]['modified'] = True
+        msg = f'Changed {changed} object(s).'
+        if skipped:
+            msg += f"\nSkipped {skipped} (no field '{fname}')."
+        if errors:
+            msg += f'\n{errors} value conversion error(s).'
+        if touched_paths:
+            msg += '\n\nFiles marked modified: ' + ', '.join((os.path.basename(p) for p in sorted(touched_paths))) + '\nUse File > Save Modified Files to write to disk.'
+        messagebox.showinfo('Batch Edit', msg)
+        self.status_var.set(f'Batch edit: {changed} object(s) changed (unsaved).')
+        if changed and self._filter_field:
+            self.filter_apply()
 
     def open_folder(self):
         folder = filedialog.askdirectory(title='Select AoH2 save folder')
@@ -373,15 +419,38 @@ class Aoh2Editor(tk.Tk):
         if not self.files:
             messagebox.showwarning('Filter', 'Open a project folder first.')
             return
+        want_field = None
+        if '=' in query:
+            fname, _, fval = query.partition('=')
+            want_field = (fname.strip(), fval.strip())
         want_id = int(query) if query.lstrip('-').isdigit() else None
         want_tag = query.lower()
         TAG_FIELDS = ('sCivTag', 'sCivName', 'sTag', 'sName')
         ID_FIELDS = ('iId', 'iID', 'iCivID', 'iCivId')
 
+        def value_equals(current, wanted_str) -> bool:
+            try:
+                if isinstance(current, bool):
+                    return current == (wanted_str.lower() in ('true', '1', 'yes'))
+                if isinstance(current, int):
+                    return current == int(wanted_str)
+                if isinstance(current, float):
+                    return current == float(wanted_str)
+            except ValueError:
+                return False
+            return str(current).lower() == wanted_str.lower()
+
         def obj_matches(fields: dict) -> bool:
+            if want_field is not None:
+                fname, fval = want_field
+                for k, v in fields.items():
+                    if k.lower() == fname.lower():
+                        return value_equals(v, fval)
+                return False
             if want_id is not None:
                 return any((fields.get(k) == want_id for k in ID_FIELDS))
             return any((fields.get(k) is not None and want_tag in str(fields[k]).lower() for k in TAG_FIELDS))
+        self._filter_field = want_field
         snapshot = list(self.files.items())
 
         def work():
@@ -400,6 +469,7 @@ class Aoh2Editor(tk.Tk):
         self.tree.delete(*self.tree.get_children(''))
         self.item_node.clear()
         self.item_owner.clear()
+        self._filter_matches = [(path, inst) for path, insts in results for inst in insts]
         total = 0
         for path, matches in results:
             info = self.files[path]
@@ -409,9 +479,15 @@ class Aoh2Editor(tk.Tk):
                 fields = codec.get_fields(inst)
                 tag = next((str(fields[k]) for k in ('sCivTag', 'sTag') if fields.get(k)), '')
                 name = next((str(fields[k]) for k in ('sCivName', 'sName') if fields.get(k)), '')
-                iid_val = next((fields[k] for k in ('iId', 'iCivID', 'iCivId') if fields.get(k) is not None), None)
+                iid_val = next((fields[k] for k in ('iIdOfProvince', 'iProvinceID', 'iId', 'iCivID', 'iCivId') if fields.get(k) is not None), None)
+                matched = ''
+                if self._filter_field is not None:
+                    fname = self._filter_field[0]
+                    real = next((k for k in fields if k.lower() == fname.lower()), None)
+                    if real is not None:
+                        matched = f'{real}={fields[real]!r}'
                 cls = codec.class_name(inst).rsplit('.', 1)[-1]
-                extra = '  '.join((x for x in (f'[{tag}]' if tag else '', name, f'id={iid_val}' if iid_val is not None else '') if x))
+                extra = '  '.join((x for x in (f'[{tag}]' if tag else '', name, f'id={iid_val}' if iid_val is not None else '', matched) if x))
                 node = codec.describe(inst, f'{cls}  {extra}'.strip(), info['seen'])
                 child = self.tree.insert(head, 'end', text=node.label)
                 self.item_node[child] = node
