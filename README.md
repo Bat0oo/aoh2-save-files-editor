@@ -68,5 +68,4 @@ folder before editing, as with any save tool.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Not affiliated with Łukasz Jakowski.
-`javaobj-py3` (the Java-serialization library) is used under its own license.
+MIT — see [LICENSE](LICENSE).
